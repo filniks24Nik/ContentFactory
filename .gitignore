@@ -1,0 +1,40 @@
+# Secrets — never commit (rule 5). Only .env.example (blank) is tracked.
+.env
+.env.*
+!.env.example
+*.key
+client_secret*.json
+*credentials*.json
+
+# Python
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Rendered media assets (asset policy: render → upload → delete; never commit video)
+*.mp4
+*.wav
+*.mp3
+tmp/
+output/
+broll/
+# …but DO commit the curated background-music beds (intentional repo assets, not renders)
+!assets/music/
+!assets/music/*.mp3
+!assets/music/*.wav
+!assets/music/*.m4a
+!assets/music/*.ogg
+
+# Vercel (telegram-bot deploy) — link metadata + local build, never commit
+.vercel/
+**/.vercel/
+node_modules/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
