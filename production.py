@@ -1,0 +1,363 @@
+"""Orchestrator — the daily production pipeline (Module 10 in docs/02 §10).
+
+Contract:
+    what it does : for each approved idea, runs script -> voice -> visuals -> assemble ->
+                   subtitle -> publish -> record -> cleanup. One reel failing is logged and
+                   skipped; the batch continues (rule 14: fail soft on runtime).
+    how to use   : `python -m src.production` (invoked by .github/workflows/production.yml).
+    depends on   : all src modules + src.config.
+
+On run: validate config, then bootstrap ideas+digest if the queue is dry (fallback ideation,
+rule 11/12), drain any Telegram approvals (best-effort), and produce the approved queue.
+Idempotent — produced ideas are skipped and already-published scripts never re-upload (rule 12).
+
+STATUS: wired last, after every module passed in isolation (rule 7).
+"""
+from __future__ import annotations
+
+import logging
+import os
+import shutil
+import tempfile
+import time
+from urllib.parse import urlparse
+
+from src import (
+    approval,
+    assembly,
+    config,
+    db,
+    factcheck,
+    ideation_fallback,
+    publish_youtube,
+    scriptwriter,
+    subtitles,
+    visuals,
+    voice,
+)
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+log = logging.getLogger("production")
+
+
+class FactCheckFailed(RuntimeError):
+    """A finished script contained a claim the independent check could not support.
+
+    Raised instead of returning quietly so run_production's per-reel handler treats it like any
+    other failure: log it, Telegram-alert the operator, skip that reel, keep the batch alive
+    (rule 14). A distinct type so the alert says WHY rather than 'RuntimeError'."""
+
+
+def _source_domain(sources: list[str] | None) -> str | None:
+    """Bare domain of the first source URL (for an on-screen citation), or None."""
+    for s in sources or []:
+        host = urlparse(s if "://" in str(s) else "http://" + str(s)).netloc.lower()
+        if host.startswith("www."):
+            host = host[4:]
+        if host:
+            return host
+    return None
+
+_PLATFORM = "youtube"
+
+# Brand footer appended to every Short's description (branding + CTA + 3 brand hashtags).
+# Complements — never duplicates — the scriptwriter's caption (hook, sources, AI disclosure) and
+# publish's #Shorts. Kept to 3 hashtags so the total stays under YouTube's 15-hashtag cap.
+# Override the whole block via the DESCRIPTION_FOOTER env var; disable via ENABLE_DESC_FOOTER=false.
+_DEFAULT_FOOTER = (
+    "—\n"
+    "📌 But It Matters — the news that actually matters, in 60 seconds.\n"
+    "🔔 New explainer Shorts every day → Subscribe @butitmatters\n\n"
+    "#ButItMatters #NewsShorts #WhyItMatters"
+)
+_YT_DESCRIPTION_MAX = 4900  # YouTube hard cap is 5000; leave headroom for publish's #Shorts
+
+
+def _with_footer(description: str) -> str:
+    """Append the brand footer to a description (toggle ENABLE_DESC_FOOTER; override DESCRIPTION_FOOTER).
+
+    Idempotent (won't double-append) and length-capped so it never blows YouTube's 5000-char limit.
+    """
+    if not config.get_bool("ENABLE_DESC_FOOTER", True):
+        return description
+    footer = (config.get("DESCRIPTION_FOOTER") or _DEFAULT_FOOTER).strip()
+    if not footer or footer in description:
+        return description
+    combined = f"{description.rstrip()}\n\n{footer}" if description.strip() else footer
+    return combined[:_YT_DESCRIPTION_MAX].rstrip()
+
+
+def _work_root() -> str:
+    root = config.get("WORK_DIR") or os.path.join(tempfile.gettempdir(), "ai-reel-factory")
+    os.makedirs(root, exist_ok=True)
+    return root
+
+
+_CORE_CHANNEL_TAGS = ("But It Matters", "News Shorts", "Why It Matters", "India News Explainer", "Trending News")
+
+
+def _build_metadata(idea: dict, script: dict, include_channel_tags: bool = True) -> dict:
+    """Map an idea + its script into YouTube upload metadata (publish enforces disclosure/#Shorts).
+
+    Prefers the scriptwriter's SEO title; merges hashtags + SEO tags + core channel tags (de-duped)
+    for maximum Shorts discoverability and search indexing.
+    """
+    title = (script.get("title") or idea.get("title") or "").strip()
+    seen, tags = set(), []
+    extra_tags = _CORE_CHANNEL_TAGS if include_channel_tags and config.get_bool("ENABLE_CHANNEL_TAGS", True) else ()
+    for t in [*script.get("hashtags", []), *script.get("tags", []), *extra_tags]:
+        t = str(t).lstrip("#").strip()
+        if t and t.lower() not in seen:
+            seen.add(t.lower())
+            tags.append(t)
+    return {"title": title, "description": _with_footer(script.get("caption", "")), "tags": tags}
+
+
+def produce_one(idea: dict, work_root: str) -> tuple[str, str]:
+    """Run the full chain for one approved idea. Returns (video_id, url). Idempotent."""
+    idea_id = idea["id"]
+
+    # Idea-level idempotency (rule 12): if this idea already shipped, don't re-render/re-upload.
+    # Checked BEFORE write_script so a retry can't create a new script and double-publish.
+    existing = db.get_published_post_for_idea(idea_id, _PLATFORM)
+    if existing and existing.get("external_id"):
+        db.set_idea_status(idea_id, "produced")
+        log.info("produce: idea %s already published (%s); skipping.",
+                 idea_id, existing["external_id"])
+        return existing["external_id"], existing.get("url") or ""
+
+    script = scriptwriter.write_script(idea)
+
+    # Independent fact-check BEFORE any render work: this is the cheapest possible place to
+    # abort, and since the channel moved to truth-first commentary (it may now reach a verdict
+    # and assign responsibility) verification is a gate rather than advice. Accuracy is the
+    # monetization gate (rule 6) — a strike costs far more than a skipped reel.
+    # Only FABRICATION-grade findings block (2026-08-07): imprecision is waived and logged, so
+    # the gate stops false stories rather than stopping the channel. See src/factcheck.py.
+    check = factcheck.verify(script["script_body"], idea.get("sources"), script.get("title") or "")
+    if check.get("minor"):
+        log.warning("produce: idea %s shipped with %d waived minor fact issue(s): %s",
+                    idea_id, len(check["minor"]), " | ".join(check["minor"][:3]))
+    # `ok=True` is ALSO what a fail-open returns, so "passed" and "could not be checked" were
+    # indistinguishable here and an unverified reel shipped looking exactly like a verified one.
+    # The gate shares a 20/day grounded budget with ideation and the scriptwriter, so it runs dry
+    # on precisely the busiest days (audit 2026-09-03). Accuracy is the monetization gate (rule 6):
+    # if it did not run, say so on the operator's phone rather than in a log nobody reads.
+    if check["ok"] and factcheck.enabled() and not factcheck.gate_ran(check):
+        log.warning("produce: idea %s is shipping UNVERIFIED — %s", idea_id, check.get("reason"))
+        _notify(f"⚠️ Idea {idea_id} ({idea.get('title')!r}) shipped UNVERIFIED — the fact-check "
+                f"gate could not run ({check.get('reason')}). Set FACTCHECK_API_KEY to give it "
+                f"its own quota, or FACTCHECK_STRICT=true to block instead.")
+    if not check["ok"]:
+        db.set_idea_status(idea_id, "rejected")
+        raise FactCheckFailed(
+            f"idea {idea_id} failed fact check: {factcheck.summary(check)}")
+
+    work = os.path.join(work_root, f"idea_{idea_id}")
+    os.makedirs(work, exist_ok=True)
+    try:
+        audio, duration = voice.synthesize(script["script_body"], work)
+        keywords = visuals.extract_keywords(script["script_body"])
+        clips = visuals.fetch_broll(keywords, duration, work)
+        raw = assembly.assemble(audio, clips, os.path.join(work, "reel_raw.mp4"))
+        # Pass the punchy title so subtitles burn it as a frame-1 hook banner (the first frame
+        # is the in-feed thumbnail). Falls back to the idea title if the SEO title is empty.
+        hook = script.get("title") or idea.get("title")
+        final = subtitles.burn_captions(raw, audio, os.path.join(work, "reel_final.mp4"),
+                                        hook_text=hook, key_points=script.get("key_points"),
+                                        source_label=_source_domain(idea.get("sources")))
+        video_id, url = publish_youtube.publish(final, _build_metadata(idea, script), script["script_id"])
+        db.set_idea_status(idea_id, "produced")
+        return video_id, url
+    finally:
+        shutil.rmtree(work, ignore_errors=True)  # render artifacts are disposable (rule 15)
+
+
+def _notify_failure(idea: dict, error: Exception) -> None:
+    """Best-effort Telegram alert on a hard per-reel failure (rule 13). Never raises."""
+    try:
+        approval._api("sendMessage", chat_id=config.require("TELEGRAM_CHAT_ID"),
+                      text=f"⚠️ Reel failed for idea {idea.get('id')} "
+                           f"({idea.get('title')!r}): {type(error).__name__}: {error}")
+    except Exception:  # noqa: BLE001 — alerting must never break the batch
+        log.warning("production: failure alert could not be sent.")
+
+
+def _release_failed_idea(idea_id: int, error: Exception) -> None:
+    """Move a transiently-failed idea OUT of the approved queue, back to the digest.
+
+    'approved' means "a human tapped Make it for this run". A reel that dies mid-chain has spent
+    that approval, so leaving the row at 'approved' is what let the next /makeshort produce it
+    with no tap at all (STATUS 2026-09-01, idea 223). It also leaked into APPROVAL_CAP, which
+    counts approved rows — three stuck ideas answered "capped" to every future tap.
+
+    Back to 'pending', not 'rejected': the failure was upstream (a 429, a 503, a dead fallback),
+    not a verdict on the idea, so it belongs in front of the operator again rather than in the
+    bin. A FactCheckFailed is the exception — produce_one already set it to 'rejected' because
+    that IS a verdict on the content, and re-offering it would just re-spend quota to reach the
+    same answer. Best-effort: never let bookkeeping kill the batch (rule 14).
+    """
+    if isinstance(error, FactCheckFailed):
+        return
+    try:
+        db.set_idea_status(idea_id, "pending")
+    except Exception:  # noqa: BLE001 — the reel already failed; don't compound it
+        log.warning("production: could not release idea %s back to pending.", idea_id)
+
+
+def run_production(limit: int | None = None, only_ids: list[int] | None = None) -> dict:
+    """Produce the approved queue (capped). One failure is logged + skipped (rule 14).
+
+    `only_ids` scopes the batch to ideas THIS run put in front of the operator. Without it the
+    queue is drained, which is correct for the scheduled cron but wrong for an on-demand run:
+    any idea still sitting at 'approved' from an earlier failed run would ship unapproved.
+    """
+    cap = limit if limit is not None else int(config.get("DAILY_REEL_CAP", "3"))
+    approved = db.get_approved_ideas()
+    if only_ids is not None:
+        wanted = {int(i) for i in only_ids}
+        skipped = [i["id"] for i in approved if int(i["id"]) not in wanted]
+        approved = [i for i in approved if int(i["id"]) in wanted]
+        if skipped:
+            log.warning("production: %d approved idea(s) not offered in this run were skipped: %s "
+                        "— they need a fresh approval.", len(skipped), skipped)
+    approved = approved[:cap]
+    if not approved:
+        log.info("production: no approved ideas to produce.")
+        return {"published": [], "failed": []}
+
+    work_root = _work_root()
+    published, failed = [], []
+    for idea in approved:
+        try:
+            video_id, url = produce_one(idea, work_root)
+            published.append({"idea_id": idea["id"], "video_id": video_id, "url": url})
+            log.info("production: published idea %s -> %s", idea["id"], url)
+        except Exception as e:  # noqa: BLE001 — fail soft per reel; keep the batch alive
+            log.exception("production: idea %s failed", idea.get("id"))
+            failed.append({"idea_id": idea.get("id"), "error": f"{type(e).__name__}: {e}"})
+            _release_failed_idea(idea.get("id"), e)
+            _notify_failure(idea, e)
+    return {"published": published, "failed": failed}
+
+
+def ensure_ideas_and_digest() -> int:
+    """If the queue is dry, run fallback ideation and send the digest. Return #ideas created."""
+    if db.get_pending_ideas() or db.get_approved_ideas():
+        return 0
+    if not config.get_bool("ENABLE_FALLBACK_IDEATION", True):
+        log.info("production: queue empty and fallback ideation disabled.")
+        return 0
+    n = ideation_fallback.run_fallback_ideation()
+    if n:
+        approval.send_digest()
+    return n
+
+
+def _notify(text: str) -> None:
+    """Best-effort Telegram message (links, status). Never raises."""
+    try:
+        approval._api("sendMessage", chat_id=config.require("TELEGRAM_CHAT_ID"), text=text)
+    except Exception:  # noqa: BLE001
+        log.warning("production: notify failed: %s", text)
+
+
+def run() -> None:
+    """Run one production cycle. See module docstring for the step order."""
+    config.validate()  # fail loud on misconfig (rule 14)
+
+    ensure_ideas_and_digest()
+
+    try:  # apply any queued approvals; Telegram being down must not block production
+        approval.process_responses(max_seconds=int(config.get("DRAIN_SECONDS", "20")))
+    except Exception as e:  # noqa: BLE001
+        log.warning("production: approval drain failed (continuing): %s", e)
+
+    summary = run_production()
+    log.info("production: done — %d published, %d failed.",
+             len(summary["published"]), len(summary["failed"]))
+
+
+def _approval_mode() -> str:
+    return (config.get("TELEGRAM_APPROVAL_MODE") or "polling").strip().lower()
+
+
+def _wait_for_webhook_decisions(max_seconds: int, poll_seconds: int = 5) -> int:
+    """Wait while the Vercel Telegram webhook writes approval taps into Supabase."""
+    deadline = time.monotonic() + max_seconds
+    while True:
+        pending = db.get_pending_ideas()
+        if not pending:
+            log.info("approval: all ideas decided via webhook.")
+            break
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            log.info("approval: webhook wait expired with %d pending idea(s).", len(pending))
+            break
+        time.sleep(min(poll_seconds, remaining))
+    approved = len(db.get_approved_ideas())
+    log.info("approval: %d approved after webhook wait.", approved)
+    return approved
+
+
+def make_on_demand(num_ideas: int = 3, wait_minutes: int = 20) -> dict:
+    """On-demand 'make a Short': propose fresh ideas to Telegram, wait for taps, produce the
+    approved ones, and reply with the links. Triggered by the make-short workflow button."""
+    config.validate()
+    # Prefer ideas already queued (the daily Anthropic Routine inserts these straight into
+    # Supabase). Only generate via the Gemini/Groq fallback when the queue is empty.
+    # BEFORE reading the queue: a stale idea reused as "today's digest" is worse than no idea
+    # at all on a daily-news channel. Best-effort — bookkeeping must never block a run (rule 14).
+    try:
+        expired = db.expire_stale_pending_ideas()
+        if expired:
+            log.info("make_on_demand: aged out %d stale pending idea(s).", expired)
+    except Exception as e:  # noqa: BLE001
+        log.warning("make_on_demand: could not age out stale ideas (%s)", e)
+
+    existing = db.get_pending_ideas()
+    if existing:
+        n = len(existing)
+        log.info("make_on_demand: %d pending idea(s) already queued (Routine).", n)
+    else:
+        try:
+            n = ideation_fallback.seed_ideas(num_ideas)
+        except Exception as e:  # noqa: BLE001 — a dry ideation pass is runtime, not misconfig
+            # Rule 14: fail loud on misconfig, SOFT on runtime. "No story cleared sourcing right
+            # now" is the soft kind — an upstream 503, a thin news feed, a search that returned
+            # nothing citable. Run 33755597063 raised here and exited 1, so the only signal the
+            # operator got was a red X in the Actions UI; a tap on the phone deserves an answer
+            # on the phone. config.validate() above still hard-stops a missing secret.
+            log.warning("make_on_demand: ideation produced nothing (%s)", e)
+            _notify(f"🤷 No Short this time — ideation came up dry: {e}")
+            return {"published": [], "failed": []}
+    _notify(f"🎬 {n} idea(s) ready — tap ✅ Make it on what you want "
+            f"(waiting up to {wait_minutes} min).")
+    # The ideas THIS run is putting in front of the operator. Captured before the digest so
+    # production can be scoped to exactly them: anything else still at 'approved' is a leftover
+    # from an earlier failed run and must not ship without a fresh tap (STATUS 2026-09-01).
+    offered = [i["id"] for i in db.get_pending_ideas()]
+    approval.send_digest()
+    if _approval_mode() == "webhook":
+        _wait_for_webhook_decisions(max_seconds=wait_minutes * 60)
+    else:
+        approval.process_responses(max_seconds=wait_minutes * 60)
+
+    summary = run_production(only_ids=offered)
+    if summary["published"]:
+        for p in summary["published"]:
+            _notify(f"✅ Published: {p['url']}")
+    else:
+        _notify("Nothing approved — no Short produced this time.")
+    log.info("make_on_demand: %d published, %d failed.",
+             len(summary["published"]), len(summary["failed"]))
+    return summary
+
+
+if __name__ == "__main__":
+    import sys
+
+    if len(sys.argv) > 1 and sys.argv[1] == "make":
+        make_on_demand(int(os.environ.get("IDEAS", "3")), int(os.environ.get("WAIT_MIN", "20")))
+    else:
+        run()
