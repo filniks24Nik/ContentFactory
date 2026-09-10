@@ -64,7 +64,7 @@ jobs:
           # the fact-check gate (~21/day of demand, so it runs dry and the GATE is what breaks).
           # Vertex serves the same models with 1,500 grounded requests/DAY free, and still serves
           # gemini-2.5-flash, which the Developer API now 404s for new projects.
-          GEMINI_USE_VERTEX: ${{ vars.GEMINI_USE_VERTEX || 'true' }}
+          GEMINI_USE_VERTEX: 'false'
           GCP_PROJECT: ${{ vars.GCP_PROJECT || 'but-it-matters-tts' }}
           GCP_LOCATION: ${{ vars.GCP_LOCATION || 'global' }}
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
