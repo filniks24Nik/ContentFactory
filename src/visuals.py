@@ -253,25 +253,33 @@ def _pexels_photo_urls(keyword: str) -> tuple[str, ...]:
 def _cloudflare_image(prompt: str, dest: str) -> bool:
     """Generate an AI image via Cloudflare Workers AI (Flux). Needs CF_API_TOKEN + CF_ACCOUNT_ID."""
     token, acct = config.get("CF_API_TOKEN"), config.get("CF_ACCOUNT_ID")
+    log.info("visuals: _cloudflare_image called — token=%s, acct=%s, prompt=%r",
+             bool(token), bool(acct), prompt[:60])
     if not (token and acct):
+        log.warning("visuals: Cloudflare AI skipped — CF_API_TOKEN or CF_ACCOUNT_ID is empty. "
+                    "Check GitHub Secrets and the env: block in make-short.yml.")
         return False
     model = config.get("CF_IMAGE_MODEL", "@cf/black-forest-labs/flux-1-schnell")
     try:
+        log.info("visuals: calling Cloudflare API — model=%s", model)
         r = requests.post(
             f"https://api.cloudflare.com/client/v4/accounts/{acct}/ai/run/{model}",
             headers={"Authorization": f"Bearer {token}"},
             json={"prompt": prompt[:2000]}, timeout=90,
         )
+        log.info("visuals: Cloudflare response status=%s", r.status_code)
         r.raise_for_status()
         if "application/json" in r.headers.get("content-type", ""):
             b64 = (r.json().get("result") or {}).get("image")
             if not b64:
+                log.warning("visuals: Cloudflare returned no image in JSON")
                 return False
             with open(dest, "wb") as f:
                 f.write(base64.b64decode(b64))
         else:
             with open(dest, "wb") as f:
                 f.write(r.content)
+        log.info("visuals: Cloudflare image saved to %s (%d bytes)", dest, os.path.getsize(dest))
         return os.path.getsize(dest) > 1000
     except Exception as e:  # noqa: BLE001
         log.warning("visuals: Cloudflare image gen failed (%s)", e)
