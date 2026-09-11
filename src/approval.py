@@ -124,10 +124,13 @@ def _handle_update(update: dict, cap: int) -> str | None:
         idea_id = None
     decision = _apply_callback(action, idea_id, cap) if idea_id is not None else "unknown"
 
-    _api("answerCallbackQuery", callback_query_id=cq["id"], text=_DECISION_TEXT[decision])
-    if msg.get("message_id"):
-        _api("editMessageText", chat_id=chat_id, message_id=msg["message_id"],
-             text=f"{_DECISION_TEXT[decision]}\n\n{msg.get('text', '')}", parse_mode="HTML")
+    try:
+        _api("answerCallbackQuery", callback_query_id=cq["id"], text=_DECISION_TEXT[decision])
+        if msg.get("message_id"):
+            _api("editMessageText", chat_id=chat_id, message_id=msg["message_id"],
+                 text=f"{_DECISION_TEXT[decision]}\n\n{msg.get('text', '')}", parse_mode="HTML")
+    except Exception as e:  # noqa: BLE001 — the DB write already succeeded; a UI ack failing
+        log.warning("approval: could not acknowledge callback in Telegram (%s)", e)
     return decision
 
 
